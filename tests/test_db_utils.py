@@ -1,6 +1,5 @@
 import pytest
-from utils.db_utils import get_database_url, get_lichess_token
-
+from src.utils.db_utils import get_database_url, get_lichess_token
 
 def test_get_database_url():
     fake_creds = {

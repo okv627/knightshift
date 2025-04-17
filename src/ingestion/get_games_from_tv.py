@@ -1,78 +1,100 @@
 #!/usr/bin/env python3
 """
 get_games_from_tv.py
+~~~~~~~~~~~~~~~~~~~~
+Streams live chess games from **Lichess TV**, parses each PGN with
+`parse_pgn_lines`, and **upserts** the results into PostgreSQL.
 
-Streams live chess games from Lichess TV channels,
-parses PGN data (via pgn_parser), and upserts records into PostgreSQL.
+Execution flow
+==============
+1. Build a shared SQLAlchemy engine + session (credentials come from
+   `config/.env.local` or AWS Secrets Manager via `load_db_credentials`).
+2. For each TV channel (bullet, blitz, …) call the Lichess streaming API.
+3. Read the PGN stream line‑by‑line, detect game boundaries, and upsert:
+      • new games   → INSERT
+      • duplicates  → UPDATE (see `upsert_game`)
+4. Repeat until the configurable `TIME_LIMIT` or `MAX_GAMES` is reached.
 """
 
-import sys
+from __future__ import annotations
+
 import logging
 import os
+import sys
 import time
-from pathlib import Path
 from datetime import datetime
-from typing import List
+from pathlib import Path
+from typing import Final, List, Sequence
 
 import requests
 from dotenv import load_dotenv
 from sqlalchemy import (
-    create_engine,
-    Table,
     Column,
-    Integer,
-    String,
     Date,
-    Time,
-    MetaData,
     DateTime,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Time,
+    create_engine,
 )
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
-# -------------------------------------------------------------------
-# Add the project root (knightshift/) to the Python path.
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────
+#   Local imports (after adding project root to PYTHONPATH)
+# ──────────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.append(str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT))  # idempotent
 
-# -------------------------------------------------------------------
-# Imports from src.utils and src.db
-# -------------------------------------------------------------------
-from src.utils.db_utils import load_db_credentials, get_database_url, get_lichess_token
+from src.db.game_upsert import build_game_data, upsert_game
+from src.utils.db_utils import get_database_url, get_lichess_token, load_db_credentials
 from src.utils.logging_utils import setup_logger
 from src.utils.pgn_parser import parse_pgn_lines
-from src.db.game_upsert import build_game_data, upsert_game
 
-# -------------------------------------------------------------------
-# Logging Setup
-# -------------------------------------------------------------------
-logger = setup_logger(name="get_games_from_tv", level=logging.INFO)
+# ──────────────────────────────────────────────────────────────────────────
+#   Environment & config
+# ──────────────────────────────────────────────────────────────────────────
+ENV_FILE = PROJECT_ROOT / "config" / ".env.local"
+load_dotenv(ENV_FILE)
 
-# -------------------------------------------------------------------
-# Environment & Configuration
-# -------------------------------------------------------------------
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / "config" / ".env.local")
-creds = load_db_credentials()
-print("Loaded PGHOST =", os.getenv("PGHOST"))
-print("RUNNING_IN_DOCKER =", os.getenv("RUNNING_IN_DOCKER"))
-logger.info("Loaded DB credentials successfully.")
+LOGGER = setup_logger("get_games_from_tv", level=logging.INFO)
 
-DATABASE_URL = get_database_url(creds)
-engine = create_engine(DATABASE_URL)
-metadata = MetaData()
+# numeric env‑vars with sane fall‑backs
+TIME_LIMIT: Final[int] = int(os.getenv("TIME_LIMIT", 30))  # seconds
+SLEEP_INTERVAL: Final[int] = int(os.getenv("SLEEP_INTERVAL", 5))  # seconds
+RATE_LIMIT_PAUSE: Final[int] = int(os.getenv("RATE_LIMIT_PAUSE", 900))
+MAX_GAMES: Final[int] = int(os.getenv("MAX_GAMES", 5000))
 
-TIME_LIMIT = int(os.getenv("TIME_LIMIT", 30))
-SLEEP_INTERVAL = int(os.getenv("SLEEP_INTERVAL", 5))
-RATE_LIMIT_PAUSE = int(os.getenv("RATE_LIMIT_PAUSE", 900))
-MAX_GAMES = int(os.getenv("MAX_GAMES", 5000))
+CHANNELS: Final[Sequence[str]] = (
+    "bullet",
+    "blitz",
+    "classical",
+    "rapid",
+    "chess960",
+    "antichess",
+    "atomic",
+    "horde",
+    "crazyhouse",
+    "bot",
+    "computer",
+    "kingOfTheHill",
+    "threeCheck",
+    "ultraBullet",
+    "racingKings",
+)
 
-# -------------------------------------------------------------------
-# Table Schema Definition
-# -------------------------------------------------------------------
-tv_channel_games_table = Table(
+# ──────────────────────────────────────────────────────────────────────────
+#   Database setup
+# ──────────────────────────────────────────────────────────────────────────
+CREDS = load_db_credentials()
+ENGINE = create_engine(get_database_url(CREDS))
+SESSION: Session = sessionmaker(bind=ENGINE)()
+
+METADATA = MetaData()
+TV_GAMES_TBL = Table(
     "tv_channel_games",
-    metadata,
+    METADATA,
     Column("id", String, primary_key=True),
     Column("event", String),
     Column("site", String),
@@ -95,14 +117,11 @@ tv_channel_games_table = Table(
     Column("ingested_at", DateTime),
 )
 
-Session = sessionmaker(bind=engine)
-session = Session()
-
-# -------------------------------------------------------------------
-# HTTP Session Setup
-# -------------------------------------------------------------------
-http_session = requests.Session()
-http_session.headers.update(
+# ──────────────────────────────────────────────────────────────────────────
+#   Lichess API session
+# ──────────────────────────────────────────────────────────────────────────
+HTTP = requests.Session()
+HTTP.headers.update(
     {
         "Content-Type": "application/x-www-form-urlencoded",
         "Authorization": f"Bearer {get_lichess_token()}",
@@ -110,138 +129,102 @@ http_session.headers.update(
 )
 
 
-# -------------------------------------------------------------------
-# Core Ingestion Functions
-# -------------------------------------------------------------------
-def process_pgn_block(
-    pgn_lines: List[bytes], updated_games: List[str], added_games: List[str]
+# ──────────────────────────────────────────────────────────────────────────
+#   Helper functions
+# ──────────────────────────────────────────────────────────────────────────
+def _process_game_block(
+    pgn_lines: List[bytes], added: List[str], updated: List[str]
 ) -> None:
-    """
-    Parse a block of PGN lines, build the game data, and upsert into DB.
-    Collect IDs of updated vs. added games in provided lists.
-    """
-    game_dict = parse_pgn_lines(pgn_lines)
-
-    if "site" in game_dict:
-        data_for_db = build_game_data(game_dict)
-        was_updated = upsert_game(session, tv_channel_games_table, data_for_db)
-        game_id = data_for_db["id"]
-        if was_updated:
-            updated_games.append(game_id)
-        else:
-            added_games.append(game_id)
-
-
-def fetch_ongoing_games(
-    channel: str, updated_games: List[str], added_games: List[str], max_retries: int = 3
-) -> None:
-    """
-    Fetch ongoing games from the Lichess TV API for a specific channel and upsert them.
-    Retries on non-429 errors, streams PGN data line by line.
-    """
-    url = f"https://lichess.org/api/tv/{channel}"
-    params = {"clocks": False, "opening": True}
-    for attempt in range(1, max_retries + 1):
-        response = http_session.get(url, params=params, stream=True)
-        if response.status_code == 429:
-            logger.error(
-                f"Rate limit encountered on channel '{channel}'. Exiting pipeline."
-            )
-            sys.exit(1)
-        if response.status_code == 200:
-            break
-        else:
-            logger.warning(
-                f"Channel '{channel}' request failed with {response.status_code}. Retry {attempt}/{max_retries}."
-            )
-            time.sleep(5)
-    else:
-        logger.error(
-            f"Failed to connect to channel '{channel}' after {max_retries} retries."
-        )
+    """Parse a single PGN block and upsert it into Postgres."""
+    game = parse_pgn_lines(pgn_lines)
+    if "site" not in game:  # sanity guard
         return
 
-    if response.status_code == 200:
-        parse_and_upsert_response(response, updated_games, added_games)
+    db_row = build_game_data(game)
+    was_updated = upsert_game(SESSION, TV_GAMES_TBL, db_row)
+    (updated if was_updated else added).append(db_row["id"])
+
+
+def _stream_channel(channel: str, added: List[str], updated: List[str]) -> None:
+    """Stream one TV channel, parse games, handle retries & rate‑limits."""
+    url = f"https://lichess.org/api/tv/{channel}"
+    params = {"clocks": False, "opening": True}
+
+    for attempt in range(1, 4):  # max 3 retries
+        resp = HTTP.get(url, params=params, stream=True)
+        if resp.status_code == 429:  # too many requests → bail out
+            LOGGER.error("Rate‑limit (429) on '%s' – exiting", channel)
+            sys.exit(1)
+        if resp.ok:
+            break
+
+        LOGGER.warning(
+            "Channel '%s' returned %s (%s/3) – retrying in 5 s",
+            channel,
+            resp.status_code,
+            attempt,
+        )
+        time.sleep(5)
     else:
-        logger.error(
-            f"Failed to connect to channel '{channel}': {response.status_code}, {response.text}"
-        )
+        LOGGER.error("Could not connect to '%s' after retries", channel)
+        return
+
+    _parse_stream(resp, added, updated)
 
 
-def parse_and_upsert_response(
-    response, updated_games: List[str], added_games: List[str]
+def _parse_stream(
+    resp: requests.Response, added: List[str], updated: List[str]
 ) -> None:
-    """
-    Parses PGN blocks and upserts them to DB.
-    A full game = header lines + 1 move line.
-    """
-    pgn_block = []
+    """Detect game boundaries (blank line + move line) and upsert each game."""
+    pgn_block: list[bytes] = []
 
-    for line in response.iter_lines():
-        if not line:
-            continue
+    for raw in resp.iter_lines():
+        if not raw:
+            continue  # keep buffering until we hit a move line
 
-        decoded = line.decode("utf-8").strip()
-        logger.debug(f"PGN LINE: {decoded}")
-        pgn_block.append(line)
+        line = raw.decode().strip()
+        LOGGER.debug("PGN %s", line)
+        pgn_block.append(raw)
 
-        if decoded.startswith("1. "):  # move line = end of current game block
-            process_pgn_block(pgn_block, updated_games, added_games)
-            pgn_block = []  # reset for next game
+        # in Lichess streaming API the first move ("1. …") ends the header
+        if line.startswith("1. "):
+            _process_game_block(pgn_block, added, updated)
+            pgn_block.clear()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#   Main ingestion loop
+# ──────────────────────────────────────────────────────────────────────────
 def run_tv_ingestion() -> None:
-    """
-    Main loop over Lichess TV channels.
-    Continues ingesting until TIME_LIMIT is reached or MAX_GAMES is fetched.
-    """
-    channels = [
-        "bullet",
-        "blitz",
-        "classical",
-        "rapid",
-        "chess960",
-        "antichess",
-        "atomic",
-        "horde",
-        "crazyhouse",
-        "bot",
-        "computer",
-        "kingOfTheHill",
-        "threeCheck",
-        "ultraBullet",
-        "racingKings",
-    ]
-    start_time = time.time()
-    total_games_count = 0
+    """Continuously fetch games from all channels until the time/game limit."""
+    start = time.time()
+    total = 0
 
-    while time.time() - start_time < TIME_LIMIT:
-        updated_games: List[str] = []
-        added_games: List[str] = []
+    while time.time() - start < TIME_LIMIT:
+        added, updated = [], []
 
-        for channel in channels:
-            logger.info(f"Fetching '{channel}' games...")
-            fetch_ongoing_games(channel, updated_games, added_games)
+        for ch in CHANNELS:
+            LOGGER.info("Fetching channel '%s'…", ch)
+            _stream_channel(ch, added, updated)
 
-        logger.info(
-            f"Batch complete: {len(updated_games)} updated, {len(added_games)} added."
-        )
-        total_games_count += len(updated_games) + len(added_games)
+        LOGGER.info("Batch done – %d added, %d updated", len(added), len(updated))
+        total += len(added) + len(updated)
 
-        if total_games_count >= MAX_GAMES:
-            logger.info(f"Fetched {MAX_GAMES} games. Pausing for 15 minutes...")
+        if total >= MAX_GAMES:
+            LOGGER.info(
+                "Reached %d games → cooling‑off for %d s", MAX_GAMES, RATE_LIMIT_PAUSE
+            )
             time.sleep(RATE_LIMIT_PAUSE)
-            total_games_count = 0
+            total = 0
 
-        logger.info("Still connected and fetching next batch of games...")
+        LOGGER.info("Sleeping %d s before next batch…", SLEEP_INTERVAL)
         time.sleep(SLEEP_INTERVAL)
 
-    logger.info("Time limit reached. Stopping ingestion.")
+    LOGGER.info("TIME_LIMIT (%s s) reached – stopping ingestion", TIME_LIMIT)
 
 
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────
+# ⏯️  CLI entry‑point
+# ──────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     run_tv_ingestion()

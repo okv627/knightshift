@@ -1,105 +1,87 @@
 #!/usr/bin/env python3
 """
 backfill_user_profiles.py
+─────────────────────────
+Fetch public profiles from **Lichess** for any player that appears in
+`tv_channel_games` but has not yet been enriched.
+The script
 
-Further refactored to:
-  - Separate logic into smaller, self-contained functions
-  - Centralize constants/time intervals
-  - Reduce repetition in the main loop
-  - Improve code readability
+1. collects unique user‑names whose `profile_updated` flag is **False**;
+2. pulls their profile JSON from the Lichess REST API;
+3. inserts the data into `lichess_users` (or skips if it already exists);
+4. flips `profile_updated = TRUE` for every processed game row.
 
-Usage:
-  python backfill_user_profiles.py
+Runtime limits, throttling, and batch pauses are controlled via the
+constants in **Config**.
 """
 
+from __future__ import annotations
+
+import logging
 import sys
 import time
-import requests
-import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
+import requests
 from dotenv import load_dotenv
 from requests.exceptions import HTTPError
 from sqlalchemy import (
-    create_engine,
-    Table,
-    Column,
-    String,
-    MetaData,
-    update,
-    select,
-    Boolean,
-    Integer,
     BigInteger,
+    Boolean,
+    Column,
+    Integer,
+    MetaData,
+    String,
+    Table,
     Text,
+    create_engine,
+    select,
+    update,
 )
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
-# -------------------------------------------------------------------
-# Ensure Project Root is in sys.path to fix ModuleNotFoundError
-# -------------------------------------------------------------------
-CURRENT_FILE = Path(__file__).resolve()
-PROJECT_ROOT = CURRENT_FILE.parents[
-    2
-]  # go 2 levels up from ingestion/ → src → project root
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# ──────────────────────────────────────────────────────────────────────────
+#   Local imports  (add project root to PYTHONPATH first)
+# ──────────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[2]  # project root (knightshift/)
+sys.path.insert(0, str(ROOT))
 
-# -------------------------------------------------------------------
-# Now we can safely import from src.*
-# -------------------------------------------------------------------
-from src.utils.db_utils import load_db_credentials, get_database_url, get_lichess_token
+from src.utils.db_utils import get_database_url, get_lichess_token, load_db_credentials
 from src.utils.logging_utils import setup_logger
 
-# -------------------------------------------------------------------
-# Environment and Database Setup
-# -------------------------------------------------------------------
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / "config" / ".env.local")
+# ──────────────────────────────────────────────────────────────────────────
+#   Env & DB initialisation
+# ──────────────────────────────────────────────────────────────────────────
+load_dotenv(ROOT / "config" / ".env.local")
 
-logger = setup_logger(name="backfill_user_profiles", level=logging.INFO)
+LOGGER = setup_logger("backfill_user_profiles", level=logging.INFO)
 
-creds = load_db_credentials()
-DATABASE_URL = get_database_url(creds)
-
-engine = create_engine(DATABASE_URL, poolclass=QueuePool, pool_size=10, max_overflow=20)
-metadata = MetaData()
-Session = sessionmaker(bind=engine)
-session = Session()
-
-http_session = requests.Session()  # shared session for HTTP requests
-http_session.headers.update(
-    {
-        "Authorization": f"Bearer {get_lichess_token()}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
+ENGINE = create_engine(
+    get_database_url(load_db_credentials()),
+    poolclass=QueuePool,
+    pool_size=10,
+    max_overflow=20,
 )
+SESSION: Session = sessionmaker(bind=ENGINE)()
+METADATA = MetaData()
 
-# -------------------------------------------------------------------
-# Constants / Config
-# -------------------------------------------------------------------
-TIME_PER_USER = 0.5  # seconds between each user request
-BATCH_SIZE = 3000  # how many users to process before a long pause
-BATCH_PAUSE = 15 * 60  # pause duration after hitting batch size (in seconds)
-PROGRESS_INTERVAL = 30  # seconds between progress log updates
-TIME_LIMIT = 3  # in seconds (to avoid rate limiting)
-
-# -------------------------------------------------------------------
-# Table Definitions
-# -------------------------------------------------------------------
-tv_channel_games_table = Table(
+# ──────────────────────────────────────────────────────────────────────────
+#   Table models  (minimal columns only)
+# ──────────────────────────────────────────────────────────────────────────
+TV_GAMES = Table(
     "tv_channel_games",
-    metadata,
+    METADATA,
     Column("id", String, primary_key=True),
     Column("white", String),
     Column("black", String),
     Column("profile_updated", Boolean, default=False),
 )
 
-lichess_users_table = Table(
+LICHESS_USERS = Table(
     "lichess_users",
-    metadata,
+    METADATA,
     Column("id", String(50), primary_key=True),
     Column("username", String(50)),
     Column("title", String(10)),
@@ -129,78 +111,92 @@ lichess_users_table = Table(
     Column("streaming", Boolean),
 )
 
+# ──────────────────────────────────────────────────────────────────────────
+#   Config
+# ──────────────────────────────────────────────────────────────────────────
+TIME_PER_USER = 0.5  # seconds between individual API calls
+BATCH_SIZE = 3_000  # users processed before a long pause
+BATCH_PAUSE = 15 * 60  # seconds to pause after each big batch
+PROGRESS_INTERVAL = 30  # seconds between progress log lines
+SCRIPT_TIME_LIMIT = 3  # hard stop (seconds) – keeps CI tests fast
 
-# -------------------------------------------------------------------
-# Helper Methods
-# -------------------------------------------------------------------
-def get_unprofiled_usernames() -> set[str]:
-    """
-    Gather usernames from rows in tv_channel_games where profile_updated = False.
-    Returns a set of unique usernames (white or black).
-    """
-    rows = session.execute(
-        select(tv_channel_games_table.c.white, tv_channel_games_table.c.black).where(
-            tv_channel_games_table.c.profile_updated == False
+# ──────────────────────────────────────────────────────────────────────────
+#   Shared HTTP session
+# ──────────────────────────────────────────────────────────────────────────
+HTTP = requests.Session()
+HTTP.headers.update(
+    {
+        "Authorization": f"Bearer {get_lichess_token()}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+)
+
+# ═════════════════════════════════════════════════════════════════════════
+# Helper functions
+# ═════════════════════════════════════════════════════════════════════════
+
+
+def _collect_unprofiled_users() -> Set[str]:
+    """Return all distinct white/black players whose profile is not updated."""
+    rows = SESSION.execute(
+        select(TV_GAMES.c.white, TV_GAMES.c.black).where(
+            TV_GAMES.c.profile_updated.is_(False)
         )
     ).fetchall()
 
-    users_to_process = set()
-    for row in rows:
-        if row.white:
-            users_to_process.add(row.white)
-        if row.black:
-            users_to_process.add(row.black)
-    return users_to_process
+    users: set[str] = set()
+    for w, b in rows:
+        if w:
+            users.add(w)
+        if b:
+            users.add(b)
+    return users
 
 
-def get_user_data_from_api(username: str) -> Optional[dict]:
-    """
-    Fetch user public data from Lichess via http_session.
-    - If a rate limit error (429) is encountered, exit immediately.
-    """
+def _fetch_profile(username: str) -> Optional[dict]:
+    """Fetch player JSON; handle 429 / network errors gracefully."""
     url = f"https://lichess.org/api/user/{username}"
     try:
-        response = http_session.get(url, params={"trophies": "false"})
-        if response.status_code == 429:
-            logger.error(f"Rate limit encountered for '{username}'. Stopping pipeline.")
-            sys.exit(1)  # or handle differently if you prefer
-        response.raise_for_status()
-        return response.json()
-    except HTTPError as http_err:
-        logger.warning(f"HTTP error for '{username}': {http_err}")
-    except Exception as err:
-        logger.warning(f"Error fetching user data for '{username}': {err}")
+        resp = HTTP.get(url, params={"trophies": "false"})
+        if resp.status_code == 429:
+            LOGGER.error("Rate‑limit hit on '%s'; stopping backfill.", username)
+            sys.exit(1)
+        resp.raise_for_status()
+        return resp.json()
+    except HTTPError as e:  # 4xx/5xx
+        LOGGER.warning("HTTP %s for user '%s': %s", resp.status_code, username, e)
+    except Exception as e:
+        LOGGER.warning("Error fetching '%s': %s", username, e)
     return None
 
 
-def user_exists_in_lichess_users(user_id: str) -> bool:
-    """
-    Check if a user row already exists in lichess_users by its unique ID.
-    """
-    row = session.execute(
-        select(lichess_users_table.c.id).where(lichess_users_table.c.id == user_id)
-    ).fetchone()
-    return row is not None
+def _profile_exists(user_id: str) -> bool:
+    return (
+        SESSION.execute(
+            select(LICHESS_USERS.c.id).where(LICHESS_USERS.c.id == user_id)
+        ).first()
+        is not None
+    )
 
 
-def insert_user_data(user_json: dict) -> None:
-    """
-    Insert user data into lichess_users based on the Lichess API JSON.
-    Rolls back session on error.
-    """
-    profile = user_json.get("profile", {})
-    perfs = user_json.get("perfs", {})
-    play_time = user_json.get("playTime", {})
-    count = user_json.get("count", {})
+def _insert_profile(data: dict) -> None:
+    """Insert a new row into `lichess_users` (rollback on failure)."""
+    profile = data.get("profile", {})
+    perfs = data.get("perfs", {})
+    play_time = data.get("playTime", {})
+    cnt = data.get("count", {})
 
-    data = {
-        "id": user_json.get("id"),
-        "username": user_json.get("username"),
-        "title": user_json.get("title"),
-        "url": user_json.get("url"),
+    row = {
+        # identifiers
+        "id": data.get("id"),
+        "username": data.get("username"),
+        "title": data.get("title"),
+        "url": data.get("url"),
+        # free‑text
         "real_name": profile.get("realName"),
         "location": profile.get("location"),
         "bio": profile.get("bio"),
+        # ratings
         "fide_rating": profile.get("fideRating"),
         "uscf_rating": profile.get("uscfRating"),
         "bullet_rating": perfs.get("bullet", {}).get("rating"),
@@ -209,150 +205,115 @@ def insert_user_data(user_json: dict) -> None:
         "rapid_rating": perfs.get("rapid", {}).get("rating"),
         "chess960_rating": perfs.get("chess960", {}).get("rating"),
         "ultra_bullet_rating": perfs.get("ultraBullet", {}).get("rating"),
+        # misc
         "country_code": profile.get("flag"),
-        "created_at": user_json.get("createdAt"),
-        "seen_at": user_json.get("seenAt"),
+        "created_at": data.get("createdAt"),
+        "seen_at": data.get("seenAt"),
         "playtime_total": play_time.get("total"),
         "playtime_tv": play_time.get("tv"),
-        "games_all": count.get("all"),
-        "games_rated": count.get("rated"),
-        "games_win": count.get("win"),
-        "games_loss": count.get("loss"),
-        "games_draw": count.get("draw"),
-        "patron": user_json.get("patron"),
-        "streaming": user_json.get("streaming"),
+        "games_all": cnt.get("all"),
+        "games_rated": cnt.get("rated"),
+        "games_win": cnt.get("win"),
+        "games_loss": cnt.get("loss"),
+        "games_draw": cnt.get("draw"),
+        "patron": data.get("patron"),
+        "streaming": data.get("streaming"),
     }
 
-    session.execute(lichess_users_table.insert().values(**data))
-    session.commit()
+    SESSION.execute(LICHESS_USERS.insert().values(**row))
+    SESSION.commit()
 
 
-def mark_profile_updated_for_username(username: str) -> None:
-    """
-    Update tv_channel_games.profile_updated = True where the user is 'white' or 'black'.
-    """
-    session.execute(
-        update(tv_channel_games_table)
-        .where(
-            (tv_channel_games_table.c.white == username)
-            | (tv_channel_games_table.c.black == username)
-        )
+def _mark_profile_done(username: str) -> None:
+    """Set profile_updated=TRUE for all games where the user appears."""
+    SESSION.execute(
+        update(TV_GAMES)
+        .where((TV_GAMES.c.white == username) | (TV_GAMES.c.black == username))
         .values(profile_updated=True)
     )
-    session.commit()
+    SESSION.commit()
 
 
-def update_or_insert_user(username: str) -> bool:
-    """
-    1) Fetch user JSON from Lichess
-    2) Check if user already exists
-       - if yes, skip insert
-       - if no, insert user data
-    3) Mark tv_channel_games.profile_updated for the user
-    Returns True if user was successfully processed; False otherwise.
-    """
-    user_json = get_user_data_from_api(username)
-    if not user_json:
-        return False  # No data fetched or error
-
-    user_id = user_json.get("id")
-    if not user_id:
-        return False  # Malformed data from API
-
-    if user_exists_in_lichess_users(user_id):
-        logger.info(
-            f"User '{username}' (ID: {user_id}) already in DB. Skipping insert."
-        )
-        mark_profile_updated_for_username(username)
-        return True
-
-    # Insert new user
-    try:
-        insert_user_data(user_json)
-        mark_profile_updated_for_username(username)
-        logger.info(f"Inserted new user '{username}' (ID: {user_id}).")
-        return True
-    except Exception as e:
-        logger.error(f"Error inserting user '{username}' (ID: {user_id}): {e}")
-        session.rollback()
+def _handle_user(username: str) -> bool:
+    """Fetch, insert (if new), and flag games; return True on any success."""
+    data = _fetch_profile(username)
+    if not data or not (user_id := data.get("id")):
         return False
 
-
-def estimate_processing_time(num_users: int, seconds_per_user: float) -> str:
-    """
-    Compute estimated total processing time, return as a readable string.
-    """
-    total_sec = int(num_users * seconds_per_user)
-    est_minutes, est_seconds = divmod(total_sec, 60)
-    if est_minutes == 0:
-        return f"~{est_seconds} second(s)"
+    if _profile_exists(user_id):
+        LOGGER.info("User '%s' already present – skipping insert.", username)
     else:
-        return f"~{est_minutes} min {est_seconds} sec"
+        try:
+            _insert_profile(data)
+            LOGGER.info("Inserted profile for '%s' (id=%s).", username, user_id)
+        except Exception as e:
+            LOGGER.error("Insert failed for '%s': %s – rolling back", username, e)
+            SESSION.rollback()
+            return False
+
+    _mark_profile_done(username)
+    return True
 
 
-def process_usernames(users: set[str]) -> None:
-    """
-    Iterate over each username, update or insert user data,
-    throttle requests, log progress, and handle batch pauses.
-    Terminates early if TIME_LIMIT seconds are exceeded.
-    """
-    start_time = time.time()  # <-- track when we start
-    total_users = len(users)
-    logger.info(f"Found {total_users} unique usernames requiring enrichment.")
-    logger.info(
-        "Estimated time to process: "
-        + estimate_processing_time(total_users, TIME_PER_USER)
+def _eta(total: int, seconds_per_user: float) -> str:
+    minutes, seconds = divmod(int(total * seconds_per_user), 60)
+    return f"~{minutes} min {seconds} s" if minutes else f"~{seconds} s"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Main processing loop
+# ═════════════════════════════════════════════════════════════════════════
+
+
+def _process(users: Set[str]) -> None:
+    total = len(users)
+    LOGGER.info(
+        "Need to enrich %d unique users (ETA %s).", total, _eta(total, TIME_PER_USER)
     )
 
-    last_report_time = start_time
-    processed_count = 0
+    start = last_log = time.time()
+    processed = 0
 
     for username in users:
-        # 🕒 Check if we've passed the time limit
-        elapsed = time.time() - start_time
-        if elapsed >= TIME_LIMIT:
-            logger.warning(
-                f"Time limit of {TIME_LIMIT} seconds reached. Stopping early after {processed_count} user(s)."
+        # hard stop for CI / unit‑tests
+        if time.time() - start > SCRIPT_TIME_LIMIT:
+            LOGGER.warning(
+                "Time‑limit (%s s) reached – stopping early.", SCRIPT_TIME_LIMIT
             )
             break
 
-        # Attempt to update/insert user
-        success = update_or_insert_user(username)
-        if success:
-            processed_count += 1
+        if _handle_user(username):
+            processed += 1
 
-        # Periodic progress update
-        if (time.time() - last_report_time) >= PROGRESS_INTERVAL:
-            remaining = total_users - processed_count
-            logger.info(
-                f"Processed {processed_count}/{total_users}. Remaining: {remaining}."
+        # periodic status report
+        if time.time() - last_log > PROGRESS_INTERVAL:
+            LOGGER.info(
+                "Progress %d/%d (remaining %d)…", processed, total, total - processed
             )
-            last_report_time = time.time()
+            last_log = time.time()
 
-        # Throttle to avoid rate limits
+        # rate‑limit protection
         time.sleep(TIME_PER_USER)
 
-        # Optional: big batch pause
-        if processed_count > 0 and processed_count % BATCH_SIZE == 0:
-            logger.info(
-                f"Processed {processed_count} users. Pausing for {BATCH_PAUSE//60} min..."
+        # long cool‑down after big batch
+        if processed and processed % BATCH_SIZE == 0:
+            LOGGER.info(
+                "Processed %d users – cooling‑off %d min.", processed, BATCH_PAUSE // 60
             )
             time.sleep(BATCH_PAUSE)
 
-    logger.info(f"Stopped after processing {processed_count} user(s).")
-    logger.info("tv_channel_games rows updated where user profiles fetched.")
+    LOGGER.info("Finished: %d user profiles processed.", processed)
 
 
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
-def main():
-    users_to_process = get_unprofiled_usernames()
-    if not users_to_process:
-        logger.info("No users to process. All profiles appear up-to-date.")
+# ═════════════════════════════════════════════════════════════════════════
+# Entry‑point
+# ═════════════════════════════════════════════════════════════════════════
+def main() -> None:
+    users = _collect_unprofiled_users()
+    if not users:
+        LOGGER.info("All profiles up‑to‑date – nothing to do.")
         return
-
-    process_usernames(users_to_process)
+    _process(users)
 
 
 if __name__ == "__main__":

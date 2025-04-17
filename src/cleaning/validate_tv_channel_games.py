@@ -1,141 +1,179 @@
 #!/usr/bin/env python3
 """
 validate_tv_channel_games.py
+────────────────────────────
+• Marks every row in **tv_channel_games** as *valid* or deletes / updates it
+  according to simple business rules:
 
-Validates and cleans rows in the tv_channel_games table.
-Ensures required fields are present, cleans Elo values, handles ECO normalization,
-and deletes or updates rows accordingly.
+    ─ required columns present
+    ─ `result` in {"1‑0", "0‑1", "1/2‑1/2"}
+    ─ cast `white_elo` / `black_elo` to INT (set NULL if malformed)
+    ─ replace ECO value “?” with NULL
+
+The script is intentionally simple and **side‑effectful**:
+it mutates / deletes rows directly and writes a short `validation_notes`
+string so downstream tasks can see what happened.
 """
 
-import os
+from __future__ import annotations
+
 import sys
 import time
 from pathlib import Path
+from typing import Tuple
+
 from dotenv import load_dotenv
 from sqlalchemy import (
-    create_engine,
-    Table,
-    MetaData,
-    select,
-    delete,
-    update,
-    Integer,
-    String,
-    Date,
-    Time,
+    BOOLEAN,
+    INTEGER,
     Column,
+    Date,
     DateTime,
-    Boolean,
+    MetaData,
+    String,
+    Table,
+    Time,
+    create_engine,
+    delete,
+    select,
+    update,
 )
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
-# --- Setup ---
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(PROJECT_ROOT))
-from utils.db_utils import load_db_credentials, get_database_url
-from utils.logging_utils import setup_logger
+# ──────────────────────────────────────────────────────────────────────────
+#   Project imports
+# ──────────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[2]  # knightshift/
+sys.path.insert(0, str(ROOT))
 
-logger = setup_logger("validate_tv_channel_games")
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / "config" / ".env.local")
+from src.utils.db_utils import get_database_url, load_db_credentials
+from src.utils.logging_utils import setup_logger
 
-# --- DB Setup ---
-creds = load_db_credentials()
-DATABASE_URL = get_database_url(creds)
-engine = create_engine(DATABASE_URL)
-metadata = MetaData()
-tv_channel_games = Table("tv_channel_games", metadata, autoload_with=engine)
-Session = sessionmaker(bind=engine)
-session = Session()
+# ──────────────────────────────────────────────────────────────────────────
+#   Env / DB initialisation
+# ──────────────────────────────────────────────────────────────────────────
+load_dotenv(ROOT / "config" / ".env.local")
 
-# --- Config ---
-THROTTLE_DELAY = 0
+LOGGER = setup_logger("validate_tv_channel_games")
+
+ENGINE = create_engine(get_database_url(load_db_credentials()))
+META = MetaData()
+
+TV_GAMES = Table("tv_channel_games", META, autoload_with=ENGINE)
+SessionLocal = sessionmaker(bind=ENGINE)
+
+# ──────────────────────────────────────────────────────────────────────────
+#   Config
+# ──────────────────────────────────────────────────────────────────────────
+REQUIRED_FIELDS = ("white", "black", "moves", "result")
+VALID_RESULTS = {"1-0", "0-1", "1/2-1/2"}
+THROTTLE_DELAY = 0  # seconds; keep 0 for now
+
+# ═════════════════════════════════════════════════════════════════════════
+# Helper utilities
+# ═════════════════════════════════════════════════════════════════════════
 
 
-# --- Validators ---
-def parse_elo(value):
+def _to_int(value) -> int | None:
+    """Return int(value) or None if cast fails / value is None."""
     try:
-        return int(value)
+        return int(value) if value is not None else None
     except (ValueError, TypeError):
         return None
 
 
-def is_row_valid(row):
-    required = ["white", "black", "moves", "result"]
-    for field in required:
-        if not getattr(row, field, None):
-            return False, f"Missing field: {field}"
-    if row.result not in {"1-0", "0-1", "1/2-1/2"}:
+def _validate_required(row) -> Tuple[bool, str]:
+    """Check presence of mandatory columns."""
+    missing = next((f for f in REQUIRED_FIELDS if not getattr(row, f, None)), None)
+    return (False, f"Missing field: {missing}") if missing else (True, "")
+
+
+def _validate_result(row) -> Tuple[bool, str]:
+    """Ensure the 'result' is one of the allowed strings."""
+    if row.result not in VALID_RESULTS:
         return False, f"Invalid result: {row.result}"
     return True, ""
 
 
-# --- Processing Logic ---
-def process_row(row):
-    game_id = row.id
-    notes = []
+# ═════════════════════════════════════════════════════════════════════════
+# Core processing
+# ═════════════════════════════════════════════════════════════════════════
 
-    valid, msg = is_row_valid(row)
-    if not valid:
-        notes.append(msg)
-        session.execute(
-            delete(tv_channel_games).where(tv_channel_games.c.id == game_id)
-        )
-        return True, True
 
-    # Elo cleaning
-    white_elo = parse_elo(row.white_elo)
-    black_elo = parse_elo(row.black_elo)
+def _process_row(session: Session, row) -> Tuple[bool, bool]:
+    """
+    Validate / clean a single DB row.
+
+    Returns: (row_processed, was_deleted)
+    """
+    notes: list[str] = []
+
+    # ⇢ mandatory columns & result value
+    for check in (_validate_required, _validate_result):
+        ok, msg = check(row)
+        if not ok:
+            notes.append(msg)
+            session.execute(delete(TV_GAMES).where(TV_GAMES.c.id == row.id))
+            return True, True  # processed + deleted
+
+    # ⇢ ELO cast
+    white_elo = _to_int(row.white_elo)
+    black_elo = _to_int(row.black_elo)
     if row.white_elo is not None and white_elo is None:
         notes.append("Invalid white_elo")
     if row.black_elo is not None and black_elo is None:
         notes.append("Invalid black_elo")
 
-    # ECO normalization
-    eco = None if getattr(row, "eco", None) == "?" else row.eco
+    # ⇢ ECO fix
+    eco_value = None if getattr(row, "eco", None) == "?" else row.eco
     if row.eco == "?":
         notes.append("Set ECO to NULL")
 
     session.execute(
-        update(tv_channel_games)
-        .where(tv_channel_games.c.id == game_id)
+        update(TV_GAMES)
+        .where(TV_GAMES.c.id == row.id)
         .values(
             white_elo=white_elo,
             black_elo=black_elo,
-            eco=eco,
+            eco=eco_value,
             is_validated=True,
             validation_notes=", ".join(notes) if notes else "Valid",
         )
     )
-    return True, False
+    return True, False  # processed, not deleted
 
 
-# --- Main Runner ---
-def validate_and_clean():
+def _validate_all() -> None:
+    session = SessionLocal()
     rows = session.execute(
-        select(tv_channel_games).where(tv_channel_games.c.is_validated.is_(False))
+        select(TV_GAMES).where(TV_GAMES.c.is_validated.is_(False))
     ).fetchall()
 
-    logger.info(f"Starting validation on {len(rows)} rows.")
-    total_updated = total_deleted = 0
+    LOGGER.info("Starting validation on %d row(s)…", len(rows))
+    updated = deleted = 0
 
     for i, row in enumerate(rows, start=1):
         try:
-            processed, deleted = process_row(row)
+            processed, was_deleted = _process_row(session, row)
             if processed:
-                total_deleted += deleted
-                total_updated += not deleted
-        except Exception as e:
-            logger.error(f"Error processing {row.id}: {e}")
+                if was_deleted:
+                    deleted += 1
+                else:
+                    updated += 1
+        except Exception as exc:
+            LOGGER.error("Error processing %s: %s – rolling back", row.id, exc)
             session.rollback()
+
         if i % 30 == 0:
-            logger.info(f"Processed {i}/{len(rows)} rows.")
+            LOGGER.info("Processed %d/%d …", i, len(rows))
         time.sleep(THROTTLE_DELAY)
 
     session.commit()
-    logger.info(
-        f"Validation complete. Updated: {total_updated}, Deleted: {total_deleted}"
-    )
+    LOGGER.info("Validation done. Updated=%d  Deleted=%d", updated, deleted)
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# Entrypoint
+# ═════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    validate_and_clean()
+    _validate_all()

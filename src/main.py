@@ -1,56 +1,66 @@
 #!/usr/bin/env python3
+# ────────────────────────────────────────────────────────────────
+#  main.py  –  “one‑shot” runner for the full KnightShift pipeline
+#
+#  Flow:  Ingest  →  Clean  →  Enrich
+#
+#  NB: In production we schedule these tasks with Airflow; this file
+#      remains handy for ad‑hoc local runs or unit‑test orchestration.
+# ────────────────────────────────────────────────────────────────
+from __future__ import annotations
 
-"""
-Top-level orchestrator for running the full KnightShift pipeline:
-Ingest → Clean → Enrich.
-Logs each step to pipeline.log and prints progress to console.
-"""
-
-import sys
 import logging
+import sys
 from pathlib import Path
+from types import FunctionType
+from typing import Final
 
-# Setup project root to enable internal imports
-SRC_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SRC_DIR.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+# ── Repo‑relative imports ───────────────────────────────────────
+SRC_DIR: Final[Path] = Path(__file__).resolve().parent
+PROJECT_ROOT: Final[Path] = SRC_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT))  # make src.* importable before pylint/mypy
 
+from src.pipeline.run_cleaning import validate_and_clean  # noqa: E402
+from src.pipeline.run_enrichment import main as run_enrichment  # noqa: E402
+from src.pipeline.run_ingestion import run_tv_ingestion  # noqa: E402
 
-from src.pipeline.run_ingestion import run_tv_ingestion
-from src.pipeline.run_cleaning import validate_and_clean
-from src.pipeline.run_enrichment import main as run_enrichment
+# ── Logging setup (shared file across stages) ───────────────────
+LOG_DIR: Final[Path] = PROJECT_ROOT / "logs"
+LOG_DIR.mkdir(exist_ok=True)
 
-# Define where logs should be stored (in the top-level /logs folder)
-# If the folder doesn’t exist yet, create it — this prevents file-not-found errors later
-# Build the full path to the log file where all output will be saved
-LOGS_DIR = PROJECT_ROOT / "logs"
-LOGS_DIR.mkdir(exist_ok=True)
-log_file_path = LOGS_DIR / "pipeline.log"
+LOG_FILE: Final[Path] = LOG_DIR / "pipeline.log"
 
-# Redirect all printed output (sys.stdout) and error messages (sys.stderr)
-# so that everything goes into our pipeline.log file
-sys.stdout = open(log_file_path, "a")
-sys.stderr = open(log_file_path, "a")
+# Pipe *everything* (print + traceback) to the same log file
+sys.stdout = sys.stderr = open(
+    LOG_FILE, "a", buffering=1, encoding="utf-8"
+)  # noqa: P201
 
-# Initialize Python’s logging system. This gives us:
-# Timestamps, log levels (INFO, WARNING, ERROR), and structured logging across all scripts
 logging.basicConfig(
-    filename=log_file_path,
+    filename=LOG_FILE,
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,  # override any previous basicConfig
 )
-
-# Wrap each stage of the pipeline (ingest, clean, enrich)
-# It prints/logs when a stage starts and ends
-def log_and_run(msg, func):
-    print(f"Starting: {msg}")
-    logging.info(f"Starting: {msg}")
-    func()
-    print(f"Finished: {msg}")
-    logging.info(f"Finished: {msg}")
+logger = logging.getLogger("main")
 
 
+# ── Small helper to reduce boilerplate ──────────────────────────
+def _stage(title: str, fn: FunctionType) -> None:
+    """
+    Wrapper that logs **start → finish** around a pipeline stage.
+    """
+    logger.info("%s – started", title)
+    try:
+        fn()
+        logger.info("%s – finished", title)
+    except Exception:  # pragma: no cover  (we want full stacktrace in log)
+        logger.exception("%s – failed", title)
+        raise
+
+
+# ── Entry‑point ─────────────────────────────────────────────────
 if __name__ == "__main__":
-    log_and_run("TV Game Ingestion", run_tv_ingestion)
-    log_and_run("Sanitize Game Records", validate_and_clean)
-    log_and_run("Backfill User Profiles", run_enrichment)
+    _stage("TV Game Ingestion", run_tv_ingestion)
+    _stage("Sanitize Game Records", validate_and_clean)
+    _stage("Back‑fill User Profiles", run_enrichment)

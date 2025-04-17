@@ -10,16 +10,16 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
-print("⚠️  CWD:", os.getcwd())
-print("📁  Files in CWD:", os.listdir())
-print("🧪  ENV:", dict(os.environ))  # Optional, or log just PG vars
+print("CWD:", os.getcwd())
+print("Files in CWD:", os.listdir())
+print("ENV:", dict(os.environ))  # Optional, or log just PG vars
 
-print("✅ Loaded .env.local")
+print("Loaded .env.local")
 
 # Load env vars from .env.local
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / "config" / ".env.local")
 
-print("✅ Loaded .env.local")
+print("Loaded .env.local")
 
 # --- Add project root (knightshift/) to sys.path ---
 CURRENT_FILE = Path(__file__).resolve()

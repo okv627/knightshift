@@ -1,88 +1,79 @@
-# ----------------------------------------------------------------------
-#  This file tells Docker how to run multiple containers together:
-#  Postgres + KnightShift pipeline
-#
-#  Run it with:
-#  docker compose up --build
-# 
-#  Run Airflow
-#  To login, use the following command:
-#  docker compose exec airflow airflow users create --username admin --password admin --firstname Matthew --lastname Tripodi --role Admin --email okv627@gmail.com
-# ----------------------------------------------------------------------
+version: "3.9"   # docker‑compose schema version
+# ─────────────────────────────────────────────────────────────
+#  KnightShift stack:  Postgres 17  +  custom pipeline image
+#                      +  Apache Airflow for orchestration
+# ─────────────────────────────────────────────────────────────
 
-services:               # define the services (containers) to be run
+x-common-env: &common_env   # 🔗 anchor reused by multiple services
+  PGHOST:     ${PGHOST}
+  PGPORT:     ${PGPORT}
+  PGDATABASE: ${PGDATABASE}
+  PGUSER:     ${PGUSER}
+  PGPASSWORD: ${PGPASSWORD}
 
+  AWS_ACCESS_KEY_ID:     ${AWS_ACCESS_KEY_ID}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+  AWS_DEFAULT_REGION:    ${AWS_DEFAULT_REGION}
+  DB_SECRET_NAME:        ${DB_SECRET_NAME}
 
+services:
+# ─────────────────────────────────────────────────────────────
   db:
-    image: postgres:17 
-    restart: always     # Automatic restart if it crashes or Docker restarts
+    image: postgres:17
+    restart: always
     environment:
-      POSTGRES_USER: ${PGUSER}
+      POSTGRES_USER:     ${PGUSER}
       POSTGRES_PASSWORD: ${PGPASSWORD}
-      POSTGRES_DB: ${PGDATABASE}
+      POSTGRES_DB:       ${PGDATABASE}
     ports:
+      # expose container‑5432 on localhost:55432 (avoids clashing with
+      # a host Postgres installation)
       - "127.0.0.1:55432:5432"
-
-    # This maps port 5432 inside Postgres container (default Postgres port) to
-    # port 55432 on local machine, avoiding conflicts with local Postgres
-
     volumes:
-      - pg_data:/var/lib/postgresql/data         # Use pg_data to persist Postgres data
-      - ./schemas:/docker-entrypoint-initdb.d    # Mount schemas folder so SQL files run on first DB startup
+      - pg_data:/var/lib/postgresql/data
+      - ./schemas:/docker-entrypoint-initdb.d   # boot‑time SQL seeds
 
+# ─────────────────────────────────────────────────────────────
   pipeline:
-    build: .              # Build this container from local Dockerfile (current directory)
-    depends_on:           # Wait for the db container to start before launching this one
-      - db
-    environment:        # existing block – extend it
-      PGHOST:     ${PGHOST}
-      PGPORT:     ${PGPORT}
-      PGDATABASE: ${PGDATABASE}
-      PGUSER:     ${PGUSER}
-      PGPASSWORD: ${PGPASSWORD}
-
-      AWS_ACCESS_KEY_ID:     ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      AWS_DEFAULT_REGION:    ${AWS_DEFAULT_REGION}
-      DB_SECRET_NAME:        ${DB_SECRET_NAME}
+    build: .
+    depends_on: [db]
+    environment: *common_env      # ← expands the anchor defined above
     volumes:
-      - ./logs:/app/logs  # Mount logs folder into the container’s /app/logs so logs persist
+      - ./logs:/app/logs          # persistent pipeline logs
     command: ["bash", "run.sh"]
 
-
+# ─────────────────────────────────────────────────────────────
   airflow:
     build:
       context: .
       dockerfile: Dockerfile.airflow
     restart: always
-    depends_on:
-      - db
-
+    depends_on: [db]
     environment:
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://postgres:postgres@db:5432/knightshift
-      - AIRFLOW__CORE__FERNET_KEY=ZVBRKuzKaNALF_NdZk4RcuKDNh1nevygtaeV0vKxaQI=
-      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=True
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - RUNNING_IN_DOCKER=true
-
+      <<: *common_env             # inherit DB / AWS creds
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres@db:5432/knightshift
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "True"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      RUNNING_IN_DOCKER: "true"
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
       - ./airflow/plugins:/opt/airflow/plugins
-      - ./src:/app/src
-      - ./config:/app/config
-
+      - ./src:/app/src              # source code for live reload
+      - ./config:/app/config        # env + config bundle
     ports:
       - "8080:8080"
-
     command: >
       bash -c "
         airflow db init &&
-        airflow users create --username admin --password admin --firstname admin --lastname admin --role Admin --email admin@example.com &&
+        airflow users create --username admin --password admin
+                            --firstname admin --lastname admin
+                            --role Admin --email admin@example.com &&
         airflow webserver & airflow scheduler
       "
 
-
+# ─────────────────────────────────────────────────────────────
 volumes:
-  pg_data:  # Named volume to persist Postgres data even after container restarts/deletes
+  pg_data:   # named volume → survives container rebuilds

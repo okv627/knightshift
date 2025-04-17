@@ -8,3 +8,7 @@ This folder contains unit tests to validate core logic of the pipeline.
 - `test_validation_logic.py`: Tests for game record validation rules.
 
 Run with: `pytest tests/`
+
+Or:
+$env:PYTHONPATH = "src"
+pytest tests/test_db_utils.py

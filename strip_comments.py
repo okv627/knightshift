@@ -41,7 +41,7 @@ def strip_comments(file_path: Path, file_type: str):
         with file_path.open("r", encoding="utf-8") as f:
             lines = f.readlines()
     except UnicodeDecodeError:
-        print(f"⚠️ Skipping unreadable file (Unicode error): {file_path}")
+        print(f"Skipping unreadable file (Unicode error): {file_path}")
         return []
 
     stripped = []
